@@ -1,0 +1,17 @@
+{
+  "nick": "micr0",
+  "privkey": "ZXe3FNLz73KiKDrAmScsdZQresOtkesMPY1l2HupBdb+t+ULe4rANjwAj029PLWSqKlVSZVVol2DSTZgAx6PiQ==",
+  "pubkey": "/rflC3uKwDY8AI9NvTy1kqipVUmVVaJdg0k2YAMej4k=",
+  "enc_privkey": "p779kZcpWG84tXmf7V9jkBGIvv1yd9IG2ra5PnjmneM=",
+  "enc_pubkey": "GUiTN3MZPkZiTfDEQ/uN8WPT8Ay2ON6vdYBoJ7FZN1w=",
+  "peers": [
+    "[200:f52d:1f3b:4965:3b2e:3a07:375:bb3]:19999"
+  ],
+  "listen_on": "[201:1808:bea0:21a3:c16f:69e6:950d:54bf]:19999",
+  "accepted": {
+    "oGRxXOH6EQVjblNFqhjf03asw+X2Uf7q3i3aXEnEu2I=": true
+  },
+  "contact_ekeys": {
+    "oGRxXOH6EQVjblNFqhjf03asw+X2Uf7q3i3aXEnEu2I=": "dZk267IaaSLQO6Wz7SCMIVEi+vl2JR5loSyqmuTr9wk="
+  }
+}

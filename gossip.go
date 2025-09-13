@@ -1,7 +1,9 @@
+// gossipy.go - Core gossip protocol implementation with file sharing
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -24,7 +26,9 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
-const Version = "0.4"
+const Version = "0.4.0"
+const MaxFileSize = 100 * 1024 * 1024 // 100MB max
+const ChunkSize = 64 * 1024           // 64KB chunks
 
 // ---------- Config & State ----------
 
@@ -54,20 +58,52 @@ type EncPayload struct {
 }
 
 type Event struct {
-	ID     string      `json:"id"`
-	Typ    string      `json:"type"`
-	Author string      `json:"author"`
-	Nick   string      `json:"nick"`
-	Body   string      `json:"body,omitempty"`
-	Enc    *EncPayload `json:"enc,omitempty"`
-	To     string      `json:"to,omitempty"`
-	TS     int64       `json:"ts"`
-	Sig    string      `json:"sig"`
+	ID       string      `json:"id"`
+	Typ      string      `json:"type"` // "msg", "dm", "file", "chunk"
+	Author   string      `json:"author"`
+	Nick     string      `json:"nick"`
+	Body     string      `json:"body,omitempty"`
+	Enc      *EncPayload `json:"enc,omitempty"`
+	To       string      `json:"to,omitempty"`
+	TS       int64       `json:"ts"`
+	Sig      string      `json:"sig"`
+	FileMeta *FileMeta   `json:"file_meta,omitempty"`
+	ChunkRef *ChunkRef   `json:"chunk_ref,omitempty"`
+}
+
+type FileMeta struct {
+	FileID     string   `json:"file_id"`
+	Name       string   `json:"name"`
+	Size       int64    `json:"size"`
+	Hash       string   `json:"hash"`
+	MimeType   string   `json:"mime_type"`
+	ChunkCount int      `json:"chunk_count"`
+	ChunkIDs   []string `json:"chunk_ids"`
+}
+
+type ChunkRef struct {
+	FileID string `json:"file_id"`
+	Index  int    `json:"index"`
+	Hash   string `json:"hash"`
+	Data   string `json:"data"` // base64 encoded chunk
 }
 
 type State struct {
-	Events map[string]Event `json:"events"`
-	Order  []string         `json:"order"`
+	Events     map[string]Event          `json:"events"`
+	Order      []string                  `json:"order"`
+	Files      map[string]*FileTransfer  `json:"files"`
+	ChunkIndex map[string]map[int]string `json:"chunk_index"` // fileID -> chunkIndex -> eventID
+}
+
+type FileTransfer struct {
+	Meta           *FileMeta      `json:"meta"`
+	ReceivedChunks map[int][]byte `json:"-"` // in memory only
+	ChunkEvents    map[int]string `json:"chunk_events"`
+	Complete       bool           `json:"complete"`
+	StartTime      time.Time      `json:"start_time"`
+	EndTime        *time.Time     `json:"end_time,omitempty"`
+	From           string         `json:"from"`
+	SavePath       string         `json:"save_path,omitempty"`
 }
 
 type WireMsg struct {
@@ -99,12 +135,13 @@ const (
 	EventPeerRequest
 	EventPeerAccepted
 	EventError
+	EventFile
+	EventFileProgress
+	EventFileComplete
 )
 
-type EventHandler func(EventType, interface{})
-
-// Message event data
 type MessageEvent struct {
+	Event     *Event
 	Timestamp time.Time
 	Author    string
 	Nick      string
@@ -112,8 +149,8 @@ type MessageEvent struct {
 	Encrypted bool
 }
 
-// DM event data
 type DMEvent struct {
+	Event     *Event
 	Timestamp time.Time
 	Author    string
 	Nick      string
@@ -123,11 +160,32 @@ type DMEvent struct {
 	Incoming  bool
 }
 
-// Peer request event data
 type PeerRequestEvent struct {
 	Pub  string
 	Nick string
 	Addr string
+}
+
+type FileEvent struct {
+	FileID   string
+	FileName string
+	FileSize int64
+	From     string
+	Nick     string
+}
+
+type FileProgressEvent struct {
+	FileID         string
+	FileName       string
+	ReceivedChunks int
+	TotalChunks    int
+	Percent        float64
+}
+
+type FileCompleteEvent struct {
+	FileID   string
+	FileName string
+	SavePath string
 }
 
 // ---------- Node ----------
@@ -166,9 +224,16 @@ type Node struct {
 	lastDMFromMu sync.Mutex
 	lastDMFrom   string
 
+	fileTransfersMu sync.Mutex
+	fileTransfers   map[string]*FileTransfer
+
+	downloadDir string
+
 	quit         chan struct{}
 	eventHandler EventHandler
 }
+
+type EventHandler func(EventType, interface{})
 
 // ---------- Public API ----------
 
@@ -191,24 +256,38 @@ func NewNode(cfgPath, statePath, iface string, port int, nick string) (*Node, er
 		return nil, err
 	}
 
+	downloadDir := filepath.Join(filepath.Dir(statePath), "downloads")
+	os.MkdirAll(downloadDir, 0755)
+
 	n := &Node{
-		cfgPath:    cfgPath,
-		cfg:        cfg,
-		statePath:  statePath,
-		state:      st,
-		iface:      iface,
-		yggIP:      yip,
-		port:       port,
-		priv:       priv,
-		pub:        pub,
-		encPriv:    encPriv,
-		encPub:     encPub,
-		peers:      map[string]struct{}{},
-		contacts:   map[string]*Contact{},
-		pending:    map[string]*Contact{},
-		acceptedBy: map[string]bool{},
-		quit:       make(chan struct{}),
+		cfgPath:       cfgPath,
+		cfg:           cfg,
+		statePath:     statePath,
+		state:         st,
+		iface:         iface,
+		yggIP:         yip,
+		port:          port,
+		priv:          priv,
+		pub:           pub,
+		encPriv:       encPriv,
+		encPub:        encPub,
+		peers:         map[string]struct{}{},
+		contacts:      map[string]*Contact{},
+		pending:       map[string]*Contact{},
+		acceptedBy:    map[string]bool{},
+		fileTransfers: map[string]*FileTransfer{},
+		downloadDir:   downloadDir,
+		quit:          make(chan struct{}),
 	}
+
+	// Restore file transfers from state
+	if st.Files != nil {
+		for id, ft := range st.Files {
+			ft.ReceivedChunks = make(map[int][]byte)
+			n.fileTransfers[id] = ft
+		}
+	}
+
 	for _, p := range cfg.Peers {
 		n.peers[p] = struct{}{}
 	}
@@ -227,6 +306,274 @@ func NewNode(cfgPath, statePath, iface string, port int, nick string) (*Node, er
 func (n *Node) SetEventHandler(handler EventHandler) {
 	n.eventHandler = handler
 }
+
+// ---------- Search & History API ----------
+
+func (n *Node) SearchMessages(query string, limit int) []Event {
+	n.stateMu.Lock()
+	defer n.stateMu.Unlock()
+
+	query = strings.ToLower(query)
+	results := []Event{}
+
+	// Search from newest to oldest
+	for i := len(n.state.Order) - 1; i >= 0 && len(results) < limit; i-- {
+		e := n.state.Events[n.state.Order[i]]
+		if e.Typ != "msg" && e.Typ != "dm" {
+			continue
+		}
+
+		// Try to decrypt and search
+		plain, ok := n.decryptEvent(&e)
+		if ok && strings.Contains(strings.ToLower(plain), query) {
+			results = append(results, e)
+			continue
+		}
+
+		// Search in nick
+		if strings.Contains(strings.ToLower(e.Nick), query) {
+			results = append(results, e)
+		}
+	}
+
+	return results
+}
+
+func (n *Node) GetMessageHistory(before time.Time, limit int) []Event {
+	n.stateMu.Lock()
+	defer n.stateMu.Unlock()
+
+	results := []Event{}
+	beforeUnix := before.Unix()
+
+	for i := len(n.state.Order) - 1; i >= 0 && len(results) < limit; i-- {
+		e := n.state.Events[n.state.Order[i]]
+		if e.Typ != "msg" || e.TS >= beforeUnix {
+			continue
+		}
+		results = append(results, e)
+	}
+
+	return results
+}
+
+func (n *Node) GetDMHistory(withPub string, limit int) []Event {
+	n.stateMu.Lock()
+	defer n.stateMu.Unlock()
+
+	results := []Event{}
+
+	for i := len(n.state.Order) - 1; i >= 0 && len(results) < limit; i-- {
+		e := n.state.Events[n.state.Order[i]]
+		if e.Typ != "dm" {
+			continue
+		}
+
+		// Check if this DM involves the target person
+		if e.Author == withPub || e.To == withPub {
+			results = append(results, e)
+		}
+	}
+
+	return results
+}
+
+// ---------- File Sharing API ----------
+
+func (n *Node) ShareFile(filePath string, toPub string) error {
+	// Check file exists and size
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("file not found: %w", err)
+	}
+	if info.Size() > MaxFileSize {
+		return fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
+	}
+
+	// Read file
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	// Calculate file hash
+	fileHash := sha256.Sum256(fileData)
+	fileID := hex.EncodeToString(fileHash[:16]) // Use first 16 bytes as ID
+
+	// Determine MIME type (basic)
+	mimeType := "application/octet-stream"
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".txt", ".md":
+		mimeType = "text/plain"
+	case ".jpg", ".jpeg":
+		mimeType = "image/jpeg"
+	case ".png":
+		mimeType = "image/png"
+	case ".gif":
+		mimeType = "image/gif"
+	case ".pdf":
+		mimeType = "application/pdf"
+	}
+
+	// Calculate chunks
+	chunkCount := (len(fileData) + ChunkSize - 1) / ChunkSize
+	chunkIDs := make([]string, chunkCount)
+
+	// Create and send chunks first
+	for i := 0; i < chunkCount; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(fileData) {
+			end = len(fileData)
+		}
+
+		chunk := fileData[start:end]
+		chunkHash := sha256.Sum256(chunk)
+
+		// Create chunk event
+		chunkRef := &ChunkRef{
+			FileID: fileID,
+			Index:  i,
+			Hash:   hex.EncodeToString(chunkHash[:]),
+			Data:   base64.StdEncoding.EncodeToString(chunk),
+		}
+
+		var ev *Event
+		if toPub == "" {
+			// Global file share
+			ev = n.createGlobalChunkEvent(chunkRef)
+		} else {
+			// DM file share
+			ev = n.createDMChunkEvent(chunkRef, toPub)
+		}
+
+		signEvent(n.priv, ev)
+		n.ingestEvent(*ev, true)
+		chunkIDs[i] = ev.ID
+	}
+
+	// Create file metadata event
+	fileMeta := &FileMeta{
+		FileID:     fileID,
+		Name:       filepath.Base(filePath),
+		Size:       info.Size(),
+		Hash:       hex.EncodeToString(fileHash[:]),
+		MimeType:   mimeType,
+		ChunkCount: chunkCount,
+		ChunkIDs:   chunkIDs,
+	}
+
+	var metaEvent *Event
+	if toPub == "" {
+		metaEvent = n.createGlobalFileEvent(fileMeta)
+	} else {
+		metaEvent = n.createDMFileEvent(fileMeta, toPub)
+	}
+
+	signEvent(n.priv, metaEvent)
+	n.ingestEvent(*metaEvent, true)
+
+	return nil
+}
+
+func (n *Node) GetPendingFiles() []*FileTransfer {
+	n.fileTransfersMu.Lock()
+	defer n.fileTransfersMu.Unlock()
+
+	var pending []*FileTransfer
+	for _, ft := range n.fileTransfers {
+		if !ft.Complete {
+			pending = append(pending, ft)
+		}
+	}
+
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].StartTime.After(pending[j].StartTime)
+	})
+
+	return pending
+}
+
+func (n *Node) GetFileProgress(fileID string) (received, total int, percent float64) {
+	n.fileTransfersMu.Lock()
+	defer n.fileTransfersMu.Unlock()
+
+	ft, ok := n.fileTransfers[fileID]
+	if !ok {
+		return 0, 0, 0
+	}
+
+	received = len(ft.ReceivedChunks)
+	total = ft.Meta.ChunkCount
+	if total > 0 {
+		percent = float64(received) / float64(total) * 100
+	}
+
+	return received, total, percent
+}
+
+func (n *Node) SaveFile(fileID string, destPath string) error {
+	n.fileTransfersMu.Lock()
+	ft, ok := n.fileTransfers[fileID]
+	if !ok {
+		n.fileTransfersMu.Unlock()
+		return fmt.Errorf("file transfer not found")
+	}
+
+	if !ft.Complete {
+		n.fileTransfersMu.Unlock()
+		return fmt.Errorf("file transfer not complete")
+	}
+	n.fileTransfersMu.Unlock()
+
+	// Reassemble file
+	var buf bytes.Buffer
+	for i := 0; i < ft.Meta.ChunkCount; i++ {
+		chunk, ok := ft.ReceivedChunks[i]
+		if !ok {
+			// Try to load from event
+			n.stateMu.Lock()
+			if eventID, ok := ft.ChunkEvents[i]; ok {
+				if e, ok := n.state.Events[eventID]; ok && e.ChunkRef != nil {
+					if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
+						chunk = data
+						ft.ReceivedChunks[i] = chunk
+					}
+				}
+			}
+			n.stateMu.Unlock()
+
+			if chunk == nil {
+				return fmt.Errorf("missing chunk %d", i)
+			}
+		}
+		buf.Write(chunk)
+	}
+
+	// Verify hash
+	fileData := buf.Bytes()
+	hash := sha256.Sum256(fileData)
+	if hex.EncodeToString(hash[:]) != ft.Meta.Hash {
+		return fmt.Errorf("file hash mismatch")
+	}
+
+	// Save to disk
+	if destPath == "" {
+		destPath = filepath.Join(n.downloadDir, ft.Meta.Name)
+	}
+
+	if err := os.WriteFile(destPath, fileData, 0644); err != nil {
+		return fmt.Errorf("save file: %w", err)
+	}
+
+	ft.SavePath = destPath
+	n.persistState()
+
+	return nil
+}
+
+// ---------- Core API (from previous version) ----------
 
 func (n *Node) GetConfig() Config {
 	n.cfgMu.Lock()
@@ -264,7 +611,7 @@ func (n *Node) GetInterface() string {
 }
 
 func (n *Node) BuildLink() string {
-	u := &url.URL{Scheme: `gossip`, Host: fmt.Sprintf(`[%s]:%d`, n.yggIP.String(), n.port)}
+	u := &url.URL{Scheme: `gossipy`, Host: fmt.Sprintf(`[%s]:%d`, n.yggIP.String(), n.port)}
 	q := url.Values{}
 	q.Set(`id`, base64.RawURLEncoding.EncodeToString(n.pub))
 	q.Set(`nick`, n.cfg.Nick)
@@ -429,7 +776,7 @@ func (n *Node) ReplyToLastDM(body string) error {
 }
 
 func (n *Node) SaveState() error {
-	return saveJSONAtomic(n.statePath, n.state)
+	return n.persistState()
 }
 
 func (n *Node) Shutdown() {
@@ -468,6 +815,68 @@ func (n *Node) ResolveWho(who string) string {
 	return ``
 }
 
+// ---------- File helpers ----------
+
+func (n *Node) createGlobalFileEvent(meta *FileMeta) *Event {
+	// Encrypt metadata for global recipients
+	metaJSON, _ := json.Marshal(meta)
+	recip := n.recipientsForGlobal()
+	enc, _ := n.encryptForRecipients(metaJSON, recip)
+
+	return &Event{
+		Typ:      "file",
+		Author:   n.cfg.PubKeyB64,
+		Nick:     n.cfg.Nick,
+		FileMeta: meta,
+		Enc:      enc,
+		TS:       time.Now().Unix(),
+	}
+}
+
+func (n *Node) createDMFileEvent(meta *FileMeta, toPub string) *Event {
+	metaJSON, _ := json.Marshal(meta)
+	recip := map[string]string{
+		n.cfg.PubKeyB64: n.encPubB64(),
+	}
+	if encPub, ok := n.getEncPubFor(toPub); ok {
+		recip[toPub] = encPub
+	}
+	enc, _ := n.encryptForRecipients(metaJSON, recip)
+
+	return &Event{
+		Typ:      "file",
+		Author:   n.cfg.PubKeyB64,
+		Nick:     n.cfg.Nick,
+		To:       toPub,
+		FileMeta: meta,
+		Enc:      enc,
+		TS:       time.Now().Unix(),
+	}
+}
+
+func (n *Node) createGlobalChunkEvent(chunk *ChunkRef) *Event {
+	// Don't encrypt chunk data itself (already in the event)
+	// But we could encrypt it if needed
+	return &Event{
+		Typ:      "chunk",
+		Author:   n.cfg.PubKeyB64,
+		Nick:     n.cfg.Nick,
+		ChunkRef: chunk,
+		TS:       time.Now().Unix(),
+	}
+}
+
+func (n *Node) createDMChunkEvent(chunk *ChunkRef, toPub string) *Event {
+	return &Event{
+		Typ:      "chunk",
+		Author:   n.cfg.PubKeyB64,
+		Nick:     n.cfg.Nick,
+		To:       toPub,
+		ChunkRef: chunk,
+		TS:       time.Now().Unix(),
+	}
+}
+
 // ---------- Utils (exported for CLI) ----------
 
 func ShortKey(b64 string) string {
@@ -479,8 +888,8 @@ func ShortKey(b64 string) string {
 }
 
 func ParseLink(s string) (addr, pubB64, nick string, err error) {
-	if !strings.HasPrefix(s, `gossip://`) {
-		return ``, ``, ``, errors.New(`not a gossip:// link`)
+	if !strings.HasPrefix(s, `gossipy://`) {
+		return ``, ``, ``, errors.New(`not a gossipy:// link`)
 	}
 	u, err := url.Parse(s)
 	if err != nil {
@@ -501,6 +910,16 @@ func ParseLink(s string) (addr, pubB64, nick string, err error) {
 }
 
 // ---------- Private methods ----------
+
+func (n *Node) persistState() error {
+	n.stateMu.Lock()
+	n.fileTransfersMu.Lock()
+	n.state.Files = n.fileTransfers
+	err := saveJSONAtomic(n.statePath, n.state)
+	n.fileTransfersMu.Unlock()
+	n.stateMu.Unlock()
+	return err
+}
 
 func saveJSONAtomic(path string, v any) error {
 	tmp := path + `.tmp`
@@ -610,9 +1029,20 @@ func loadOrInitState(path string) (*State, error) {
 		if s.Events == nil {
 			s.Events = map[string]Event{}
 		}
+		if s.Files == nil {
+			s.Files = map[string]*FileTransfer{}
+		}
+		if s.ChunkIndex == nil {
+			s.ChunkIndex = map[string]map[int]string{}
+		}
 		return &s, nil
 	}
-	s := &State{Events: map[string]Event{}, Order: []string{}}
+	s := &State{
+		Events:     map[string]Event{},
+		Order:      []string{},
+		Files:      map[string]*FileTransfer{},
+		ChunkIndex: map[string]map[int]string{},
+	}
 	if err := saveJSONAtomic(path, s); err != nil {
 		return nil, err
 	}
@@ -767,7 +1197,7 @@ func (n *Node) handleConn(conn net.Conn) {
 	defer conn.Close()
 	enc := json.NewEncoder(conn)
 	dec := bufio.NewScanner(conn)
-	dec.Buffer(make([]byte, 0, 65536), 2<<20)
+	dec.Buffer(make([]byte, 0, 65536), 10<<20)
 
 	if err := enc.Encode(WireMsg{Kind: `HELLO`, Node: n.cfg.PubKeyB64, Nick: n.cfg.Nick, Listen: n.cfg.ListenOn, EKey: base64.StdEncoding.EncodeToString(n.encPub[:])}); err != nil {
 		return
@@ -883,7 +1313,7 @@ func (n *Node) dialOnce(addr string) {
 	defer conn.Close()
 
 	dec := bufio.NewScanner(conn)
-	dec.Buffer(make([]byte, 0, 65536), 2<<20)
+	dec.Buffer(make([]byte, 0, 65536), 10<<20)
 	enc := json.NewEncoder(conn)
 
 	if !dec.Scan() {
@@ -950,7 +1380,7 @@ func (n *Node) dialAndAck(addr string) {
 	}
 	defer conn.Close()
 	dec := bufio.NewScanner(conn)
-	dec.Buffer(make([]byte, 0, 65536), 2<<20)
+	dec.Buffer(make([]byte, 0, 65536), 10<<20)
 	enc := json.NewEncoder(conn)
 
 	if !dec.Scan() {
@@ -1066,7 +1496,15 @@ func (n *Node) ingestEvent(e Event, local bool) {
 	n.state.Events[e.ID] = e
 	n.state.Order = append(n.state.Order, e.ID)
 	n.stateMu.Unlock()
-	_ = saveJSONAtomic(n.statePath, n.state)
+
+	// Handle file-related events
+	if e.Typ == "file" && e.FileMeta != nil {
+		n.handleFileMetaEvent(&e)
+	} else if e.Typ == "chunk" && e.ChunkRef != nil {
+		n.handleChunkEvent(&e)
+	}
+
+	n.persistState()
 
 	if n.eventHandler == nil {
 		return
@@ -1076,6 +1514,7 @@ func (n *Node) ingestEvent(e Event, local bool) {
 	switch e.Typ {
 	case `msg`:
 		n.eventHandler(EventMessage, MessageEvent{
+			Event:     &e,
 			Timestamp: time.Unix(e.TS, 0),
 			Author:    e.Author,
 			Nick:      e.Nick,
@@ -1085,6 +1524,7 @@ func (n *Node) ingestEvent(e Event, local bool) {
 	case `dm`:
 		if e.Author == n.cfg.PubKeyB64 {
 			n.eventHandler(EventDM, DMEvent{
+				Event:     &e,
 				Timestamp: time.Unix(e.TS, 0),
 				Author:    e.Author,
 				Nick:      e.Nick,
@@ -1100,6 +1540,7 @@ func (n *Node) ingestEvent(e Event, local bool) {
 				n.lastDMFromMu.Unlock()
 			}
 			n.eventHandler(EventDM, DMEvent{
+				Event:     &e,
 				Timestamp: time.Unix(e.TS, 0),
 				Author:    e.Author,
 				Nick:      e.Nick,
@@ -1110,6 +1551,108 @@ func (n *Node) ingestEvent(e Event, local bool) {
 			})
 		}
 	}
+}
+
+func (n *Node) handleFileMetaEvent(e *Event) {
+	if e.FileMeta == nil {
+		return
+	}
+
+	// Check if this is for us (DM) or global
+	if e.To != "" && e.To != n.cfg.PubKeyB64 && e.Author != n.cfg.PubKeyB64 {
+		return // Not for us
+	}
+
+	n.fileTransfersMu.Lock()
+	if _, exists := n.fileTransfers[e.FileMeta.FileID]; !exists {
+		ft := &FileTransfer{
+			Meta:           e.FileMeta,
+			ReceivedChunks: make(map[int][]byte),
+			ChunkEvents:    make(map[int]string),
+			Complete:       false,
+			StartTime:      time.Now(),
+			From:           e.Author,
+		}
+		n.fileTransfers[e.FileMeta.FileID] = ft
+
+		// Check if we already have all chunks
+		n.stateMu.Lock()
+		if chunkMap, ok := n.state.ChunkIndex[e.FileMeta.FileID]; ok {
+			for idx, eventID := range chunkMap {
+				ft.ChunkEvents[idx] = eventID
+			}
+			if len(ft.ChunkEvents) == e.FileMeta.ChunkCount {
+				ft.Complete = true
+				now := time.Now()
+				ft.EndTime = &now
+			}
+		}
+		n.stateMu.Unlock()
+	}
+	n.fileTransfersMu.Unlock()
+
+	if n.eventHandler != nil {
+		n.eventHandler(EventFile, FileEvent{
+			FileID:   e.FileMeta.FileID,
+			FileName: e.FileMeta.Name,
+			FileSize: e.FileMeta.Size,
+			From:     e.Author,
+			Nick:     e.Nick,
+		})
+	}
+}
+
+func (n *Node) handleChunkEvent(e *Event) {
+	if e.ChunkRef == nil {
+		return
+	}
+
+	// Update chunk index
+	n.stateMu.Lock()
+	if n.state.ChunkIndex == nil {
+		n.state.ChunkIndex = make(map[string]map[int]string)
+	}
+	if n.state.ChunkIndex[e.ChunkRef.FileID] == nil {
+		n.state.ChunkIndex[e.ChunkRef.FileID] = make(map[int]string)
+	}
+	n.state.ChunkIndex[e.ChunkRef.FileID][e.ChunkRef.Index] = e.ID
+	n.stateMu.Unlock()
+
+	// Update file transfer
+	n.fileTransfersMu.Lock()
+	ft, ok := n.fileTransfers[e.ChunkRef.FileID]
+	if ok {
+		// Decode and store chunk
+		if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
+			ft.ReceivedChunks[e.ChunkRef.Index] = data
+			ft.ChunkEvents[e.ChunkRef.Index] = e.ID
+
+			// Check if complete
+			if len(ft.ChunkEvents) == ft.Meta.ChunkCount {
+				ft.Complete = true
+				now := time.Now()
+				ft.EndTime = &now
+
+				if n.eventHandler != nil {
+					n.eventHandler(EventFileComplete, FileCompleteEvent{
+						FileID:   e.ChunkRef.FileID,
+						FileName: ft.Meta.Name,
+					})
+				}
+			} else if n.eventHandler != nil {
+				// Progress update
+				percent := float64(len(ft.ReceivedChunks)) / float64(ft.Meta.ChunkCount) * 100
+				n.eventHandler(EventFileProgress, FileProgressEvent{
+					FileID:         e.ChunkRef.FileID,
+					FileName:       ft.Meta.Name,
+					ReceivedChunks: len(ft.ReceivedChunks),
+					TotalChunks:    ft.Meta.ChunkCount,
+					Percent:        percent,
+				})
+			}
+		}
+	}
+	n.fileTransfersMu.Unlock()
 }
 
 // ---------- Event verification ----------
@@ -1147,19 +1690,21 @@ func canonicalizeEnc(enc *EncPayload) *encDigest {
 
 func eventDigest(e *Event) []byte {
 	type bare struct {
-		Typ    string     `json:"type"`
-		Author string     `json:"author"`
-		Nick   string     `json:"nick"`
-		Body   string     `json:"body,omitempty"`
-		To     string     `json:"to,omitempty"`
-		TS     int64      `json:"ts"`
-		Enc    *encDigest `json:"enc,omitempty"`
+		Typ      string     `json:"type"`
+		Author   string     `json:"author"`
+		Nick     string     `json:"nick"`
+		Body     string     `json:"body,omitempty"`
+		To       string     `json:"to,omitempty"`
+		TS       int64      `json:"ts"`
+		Enc      *encDigest `json:"enc,omitempty"`
+		FileMeta *FileMeta  `json:"file_meta,omitempty"`
+		ChunkRef *ChunkRef  `json:"chunk_ref,omitempty"`
 	}
 	var encD *encDigest
 	if e.Enc != nil {
 		encD = canonicalizeEnc(e.Enc)
 	}
-	j, _ := json.Marshal(bare{e.Typ, e.Author, e.Nick, e.Body, e.To, e.TS, encD})
+	j, _ := json.Marshal(bare{e.Typ, e.Author, e.Nick, e.Body, e.To, e.TS, encD, e.FileMeta, e.ChunkRef})
 	sum := sha256.Sum256(j)
 	return sum[:]
 }

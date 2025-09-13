@@ -1,3 +1,4 @@
+// cli.go - Command-line interface for gossipy with file sharing
 package main
 
 import (
@@ -12,8 +13,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	qrterminal "github.com/mdp/qrterminal/v3"
 )
@@ -22,8 +25,8 @@ func main() {
 	var (
 		iface = flag.String("iface", "tun0", "Yggdrasil interface (e.g. tun0 or ygg0)")
 		port  = flag.Int("port", 19999, "TCP port to listen on (IPv6)")
-		state = flag.String("state", "./gossip_state.json", "Path to state JSON")
-		conf  = flag.String("config", "./gossip_config.json", "Path to config JSON")
+		state = flag.String("state", "./gossipy_state.json", "Path to state JSON")
+		conf  = flag.String("config", "./gossipy_config.json", "Path to config JSON")
 		nick  = flag.String("nick", "", "Nickname (optional)")
 		peer  = flag.String("peer", "", "Add a peer on startup ([IPv6]:port)")
 	)
@@ -79,6 +82,27 @@ func main() {
 						dm.Body)
 				}
 			}
+		case EventFile:
+			fe := data.(FileEvent)
+			size := formatFileSize(fe.FileSize)
+			fmt.Printf("[%s] 📎 %s shared file: %s (%s) - ID: %s\n",
+				time.Now().Format("15:04:05"),
+				displayFromPub(fe.Nick, fe.From),
+				fe.FileName,
+				size,
+				fe.FileID[:8])
+		case EventFileProgress:
+			fp := data.(FileProgressEvent)
+			fmt.Printf("\r[file] %s: %.1f%% (%d/%d chunks)",
+				fp.FileName,
+				fp.Percent,
+				fp.ReceivedChunks,
+				fp.TotalChunks)
+		case EventFileComplete:
+			fc := data.(FileCompleteEvent)
+			fmt.Printf("\n[file] ✅ %s complete! Use /files to see, /save %s to download\n",
+				fc.FileName,
+				fc.FileID[:8])
 		case EventPeerRequest:
 			req := data.(PeerRequestEvent)
 			fmt.Printf("[request] %s (%s) asks to peer: %s — /accept %s\n",
@@ -121,10 +145,11 @@ func main() {
 	}()
 
 	// Print startup info
-	fmt.Printf("gossip v%s | nick=%q | id=%s\n", Version, node.GetNick(), ShortKey(node.GetPublicKeyB64()))
+	fmt.Printf("gossipy v%s | nick=%q | id=%s\n", Version, node.GetNick(), ShortKey(node.GetPublicKeyB64()))
 	fmt.Printf("Address: [%s]:%d (iface=%s)\n", node.GetYggIP().String(), node.GetPort(), node.GetInterface())
 	fmt.Printf("Peers: %v\n", node.ListPeers())
-	fmt.Println("Tip: /link to print a QR; /accept <gossip://…> to connect; /pending then /accept <SHORTID> to approve.")
+	fmt.Println("Tip: /link to print a QR; /accept <gossipy://…> to connect; /pending then /accept <SHORTID> to approve.")
+	fmt.Println("New: /file <path> [to] to share files; /files to see downloads; /save <id> to save")
 
 	// Start REPL
 	go repl(node)
@@ -169,7 +194,7 @@ func handleCommand(node *Node, line string) {
 	switch cmd {
 	case "help":
 		fmt.Println(`Commands:
-  /link                   show your gossip:// link + QR
+  /link                   show your gossipy:// link + QR
   /accept <link|pub|id>   accept pending OR connect using a link
   /pending                list pending peer requests
   /contacts               list known contacts
@@ -178,10 +203,18 @@ func handleCommand(node *Node, line string) {
   /nick <name>            set nickname
   /msg <who> <text>       DM to nick|SHORTID|pubkey
   /r <text>               reply to last incoming DM
+  /search <query>         search messages
+  /history [n]            show last n messages (default 20)
+  /dmhistory <who> [n]    show DM history with someone
+  /file <path> [to]       share a file (globally or to someone)
+  /files                  list pending file transfers
+  /save <fileid> [path]   save a received file
   /save                   save state
   /quit                   exit`)
+
 	case "link":
 		showLinkQR(node)
+
 	case "pending":
 		pending := node.GetPendingRequests()
 		if len(pending) == 0 {
@@ -194,6 +227,7 @@ func handleCommand(node *Node, line string) {
 				displayAddr(c.Addr),
 				c.LastSeen.Format("15:04:05"))
 		}
+
 	case "contacts":
 		contacts := node.GetContacts()
 		if len(contacts) == 0 {
@@ -215,13 +249,14 @@ func handleCommand(node *Node, line string) {
 					acc, enc)
 			}
 		}
+
 	case "accept":
 		if len(parts) < 2 {
-			fmt.Println("usage: /accept <gossip://... | pubkey | SHORTID>")
+			fmt.Println("usage: /accept <gossipy://... | pubkey | SHORTID>")
 			return
 		}
 		arg := strings.TrimSpace(strings.TrimPrefix(line, "/accept"))
-		if strings.HasPrefix(arg, "gossip://") {
+		if strings.HasPrefix(arg, "gossipy://") {
 			err := node.AcceptPeerByLink(arg)
 			if err != nil {
 				fmt.Println("[err]", err)
@@ -241,6 +276,7 @@ func handleCommand(node *Node, line string) {
 				fmt.Printf("[ok] accepted peer\n")
 			}
 		}
+
 	case "unpeer":
 		if len(parts) < 2 {
 			fmt.Println("usage: /unpeer <pub|SHORTID>")
@@ -252,10 +288,12 @@ func handleCommand(node *Node, line string) {
 		} else {
 			fmt.Printf("[ok] unpeered %s\n", ShortKey(parts[1]))
 		}
+
 	case "peers":
 		for _, p := range node.ListPeers() {
 			fmt.Println(" -", p)
 		}
+
 	case "nick":
 		if len(parts) < 2 {
 			fmt.Println("usage: /nick <name>")
@@ -264,6 +302,7 @@ func handleCommand(node *Node, line string) {
 		newNick := strings.TrimSpace(strings.TrimPrefix(line, "/nick"))
 		node.SetNick(newNick)
 		fmt.Println("[ok] nick set")
+
 	case "msg":
 		if len(parts) < 3 {
 			fmt.Println("usage: /msg <who> <text>")
@@ -278,6 +317,7 @@ func handleCommand(node *Node, line string) {
 		if err != nil {
 			fmt.Println("[err]", err)
 		}
+
 	case "r":
 		if len(parts) < 2 {
 			fmt.Println("usage: /r <text>")
@@ -288,13 +328,191 @@ func handleCommand(node *Node, line string) {
 		if err != nil {
 			fmt.Println("[err]", err)
 		}
+
+	case "search":
+		if len(parts) < 2 {
+			fmt.Println("usage: /search <query>")
+			return
+		}
+		query := strings.TrimSpace(strings.TrimPrefix(line, "/search"))
+		results := node.SearchMessages(query, 20)
+		if len(results) == 0 {
+			fmt.Println("No results found")
+		} else {
+			fmt.Printf("Found %d results:\n", len(results))
+			for _, e := range results {
+				displayEvent(node, &e)
+			}
+		}
+
+	case "history":
+		limit := 20
+		if len(parts) > 1 {
+			fmt.Sscanf(parts[1], "%d", &limit)
+		}
+		events := node.GetMessageHistory(time.Now(), limit)
+		if len(events) == 0 {
+			fmt.Println("No messages in history")
+		} else {
+			// Display in chronological order (reverse)
+			for i := len(events) - 1; i >= 0; i-- {
+				displayEvent(node, &events[i])
+			}
+		}
+
+	case "dmhistory":
+		if len(parts) < 2 {
+			fmt.Println("usage: /dmhistory <who> [limit]")
+			return
+		}
+		who := parts[1]
+		pub := node.ResolveWho(who)
+		if pub == "" {
+			fmt.Println("[err] unknown contact:", who)
+			return
+		}
+		limit := 20
+		if len(parts) > 2 {
+			fmt.Sscanf(parts[2], "%d", &limit)
+		}
+		events := node.GetDMHistory(pub, limit)
+		if len(events) == 0 {
+			fmt.Println("No DM history")
+		} else {
+			fmt.Printf("DM history with %s:\n", who)
+			// Display in chronological order (reverse)
+			for i := len(events) - 1; i >= 0; i-- {
+				displayEvent(node, &events[i])
+			}
+		}
+
+	case "file":
+		if len(parts) < 2 {
+			fmt.Println("usage: /file <path> [to_who]")
+			return
+		}
+		filePath := expandPath(parts[1])
+		var toPub string
+		if len(parts) > 2 {
+			who := parts[2]
+			toPub = node.ResolveWho(who)
+			if toPub == "" {
+				fmt.Println("[err] unknown recipient:", who)
+				return
+			}
+		}
+
+		fmt.Printf("Sharing file: %s", filepath.Base(filePath))
+		if toPub != "" {
+			fmt.Printf(" to %s", targetLabel(node, toPub))
+		} else {
+			fmt.Printf(" globally")
+		}
+		fmt.Println("...")
+
+		err := node.ShareFile(filePath, toPub)
+		if err != nil {
+			fmt.Println("[err]", err)
+		} else {
+			fmt.Println("[ok] file shared!")
+		}
+
+	case "files":
+		files := node.GetPendingFiles()
+		if len(files) == 0 {
+			fmt.Println("No file transfers")
+		} else {
+			fmt.Println("File transfers:")
+			for _, ft := range files {
+				status := "pending"
+				if ft.Complete {
+					status = "complete"
+					if ft.SavePath != "" {
+						status = fmt.Sprintf("saved to %s", ft.SavePath)
+					}
+				} else {
+					r, t, p := node.GetFileProgress(ft.Meta.FileID)
+					status = fmt.Sprintf("%.1f%% (%d/%d chunks)", p, r, t)
+				}
+				from := displayFromPub("", ft.From)
+				fmt.Printf(" - %s: %s (%s) from %s - %s\n",
+					ft.Meta.FileID[:8],
+					ft.Meta.Name,
+					formatFileSize(ft.Meta.Size),
+					from,
+					status)
+			}
+		}
+
 	case "save":
-		node.SaveState()
-		fmt.Println("[ok] saved")
+		if len(parts) < 2 {
+			// Just save state
+			node.SaveState()
+			fmt.Println("[ok] state saved")
+			return
+		}
+
+		fileID := parts[1]
+		// Find matching file ID (allow prefix match)
+		files := node.GetPendingFiles()
+		var matchedFile *FileTransfer
+		for _, ft := range files {
+			if strings.HasPrefix(ft.Meta.FileID, fileID) {
+				matchedFile = ft
+				break
+			}
+		}
+
+		if matchedFile == nil {
+			fmt.Println("[err] file not found:", fileID)
+			return
+		}
+
+		var destPath string
+		if len(parts) > 2 {
+			destPath = expandPath(parts[2])
+		}
+
+		fmt.Printf("Saving %s...\n", matchedFile.Meta.Name)
+		err := node.SaveFile(matchedFile.Meta.FileID, destPath)
+		if err != nil {
+			fmt.Println("[err]", err)
+		} else {
+			if destPath == "" {
+				destPath = filepath.Join("downloads", matchedFile.Meta.Name)
+			}
+			fmt.Printf("[ok] saved to %s\n", destPath)
+		}
+
 	case "quit", "exit":
 		node.Shutdown()
+
 	default:
 		fmt.Println("unknown command. /help for help")
+	}
+}
+
+func displayEvent(node *Node, e *Event) {
+	ts := time.Unix(e.TS, 0).Format("15:04:05")
+	switch e.Typ {
+	case "msg":
+		fmt.Printf("[%s][global] %s: ", ts, displayFrom(e.Nick, e.Author))
+		if plain, ok := node.decryptEvent(e); ok {
+			fmt.Println(plain)
+		} else {
+			fmt.Println("[encrypted]")
+		}
+	case "dm":
+		if e.Author == node.GetPublicKeyB64() {
+			fmt.Printf("[%s] ✉️ to %s: ", ts, targetLabel(node, e.To))
+		} else {
+			fmt.Printf("[%s] ✉️ from %s: ", ts, displayFrom(e.Nick, e.Author))
+		}
+		if plain, ok := node.decryptEvent(e); ok {
+			fmt.Println(plain)
+		} else {
+			fmt.Println("[encrypted]")
+		}
 	}
 }
 
@@ -392,4 +610,27 @@ func nickOrShort(pub, nick string) string {
 		return nick
 	}
 	return "~" + ShortKey(pub)
+}
+
+func formatFileSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	return path
 }
