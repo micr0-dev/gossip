@@ -1,4 +1,3 @@
-// gossip.go - Core gossip protocol implementation with file sharing
 package main
 
 import (
@@ -26,7 +25,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.1"
 const MaxFileSize = 100 * 1024 * 1024 // 100MB max
 const ChunkSize = 64 * 1024           // 64KB chunks
 
@@ -59,7 +58,7 @@ type EncPayload struct {
 
 type Event struct {
 	ID       string      `json:"id"`
-	Typ      string      `json:"type"` // "msg", "dm", "file", "chunk"
+	Typ      string      `json:"type"` // "msg", "dm", "file_announce", "file_request", "chunk"
 	Author   string      `json:"author"`
 	Nick     string      `json:"nick"`
 	Body     string      `json:"body,omitempty"`
@@ -68,42 +67,53 @@ type Event struct {
 	TS       int64       `json:"ts"`
 	Sig      string      `json:"sig"`
 	FileMeta *FileMeta   `json:"file_meta,omitempty"`
+	FileReq  *FileReq    `json:"file_req,omitempty"`
 	ChunkRef *ChunkRef   `json:"chunk_ref,omitempty"`
 }
 
 type FileMeta struct {
-	FileID     string   `json:"file_id"`
-	Name       string   `json:"name"`
-	Size       int64    `json:"size"`
-	Hash       string   `json:"hash"`
-	MimeType   string   `json:"mime_type"`
-	ChunkCount int      `json:"chunk_count"`
-	ChunkIDs   []string `json:"chunk_ids"`
+	FileID     string `json:"file_id"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	Hash       string `json:"hash"`
+	MimeType   string `json:"mime_type"`
+	ChunkCount int    `json:"chunk_count"`
+}
+
+type FileReq struct {
+	FileID    string `json:"file_id"`
+	Requester string `json:"requester"`
 }
 
 type ChunkRef struct {
-	FileID string `json:"file_id"`
-	Index  int    `json:"index"`
-	Hash   string `json:"hash"`
-	Data   string `json:"data"` // base64 encoded chunk
+	FileID    string `json:"file_id"`
+	Index     int    `json:"index"`
+	Hash      string `json:"hash"`
+	Data      string `json:"data"`                // base64 encoded chunk
+	Requester string `json:"requester,omitempty"` // who requested this chunk
 }
 
 type State struct {
-	Events     map[string]Event          `json:"events"`
-	Order      []string                  `json:"order"`
-	Files      map[string]*FileTransfer  `json:"files"`
-	ChunkIndex map[string]map[int]string `json:"chunk_index"` // fileID -> chunkIndex -> eventID
+	Events map[string]Event `json:"events"`
+	Order  []string         `json:"order"`
 }
 
-type FileTransfer struct {
-	Meta           *FileMeta      `json:"meta"`
-	ReceivedChunks map[int][]byte `json:"-"` // in memory only
-	ChunkEvents    map[int]string `json:"chunk_events"`
-	Complete       bool           `json:"complete"`
-	StartTime      time.Time      `json:"start_time"`
-	EndTime        *time.Time     `json:"end_time,omitempty"`
-	From           string         `json:"from"`
-	SavePath       string         `json:"save_path,omitempty"`
+type FileOffer struct {
+	Meta      *FileMeta
+	LocalPath string // path to the actual file (for sharing)
+	From      string // who's offering
+	Nick      string
+	OfferTime time.Time
+	IsLocal   bool // true if we're offering this file
+}
+
+type FileDownload struct {
+	Meta           *FileMeta
+	ReceivedChunks map[int][]byte
+	RequestTime    time.Time
+	From           string
+	Complete       bool
+	SavePath       string
 }
 
 type WireMsg struct {
@@ -135,7 +145,7 @@ const (
 	EventPeerRequest
 	EventPeerAccepted
 	EventError
-	EventFile
+	EventFileOffer
 	EventFileProgress
 	EventFileComplete
 )
@@ -166,7 +176,7 @@ type PeerRequestEvent struct {
 	Addr string
 }
 
-type FileEvent struct {
+type FileOfferEvent struct {
 	FileID   string
 	FileName string
 	FileSize int64
@@ -224,8 +234,11 @@ type Node struct {
 	lastDMFromMu sync.Mutex
 	lastDMFrom   string
 
-	fileTransfersMu sync.Mutex
-	fileTransfers   map[string]*FileTransfer
+	fileOffersMu sync.Mutex
+	fileOffers   map[string]*FileOffer // Available files
+
+	fileDownloadsMu sync.Mutex
+	fileDownloads   map[string]*FileDownload // Files we're downloading
 
 	downloadDir string
 
@@ -275,17 +288,10 @@ func NewNode(cfgPath, statePath, iface string, port int, nick string) (*Node, er
 		contacts:      map[string]*Contact{},
 		pending:       map[string]*Contact{},
 		acceptedBy:    map[string]bool{},
-		fileTransfers: map[string]*FileTransfer{},
+		fileOffers:    map[string]*FileOffer{},
+		fileDownloads: map[string]*FileDownload{},
 		downloadDir:   downloadDir,
 		quit:          make(chan struct{}),
-	}
-
-	// Restore file transfers from state
-	if st.Files != nil {
-		for id, ft := range st.Files {
-			ft.ReceivedChunks = make(map[int][]byte)
-			n.fileTransfers[id] = ft
-		}
 	}
 
 	for _, p := range cfg.Peers {
@@ -316,21 +322,18 @@ func (n *Node) SearchMessages(query string, limit int) []Event {
 	query = strings.ToLower(query)
 	results := []Event{}
 
-	// Search from newest to oldest
 	for i := len(n.state.Order) - 1; i >= 0 && len(results) < limit; i-- {
 		e := n.state.Events[n.state.Order[i]]
 		if e.Typ != "msg" && e.Typ != "dm" {
 			continue
 		}
 
-		// Try to decrypt and search
 		plain, ok := n.decryptEvent(&e)
 		if ok && strings.Contains(strings.ToLower(plain), query) {
 			results = append(results, e)
 			continue
 		}
 
-		// Search in nick
 		if strings.Contains(strings.ToLower(e.Nick), query) {
 			results = append(results, e)
 		}
@@ -369,7 +372,6 @@ func (n *Node) GetDMHistory(withPub string, limit int) []Event {
 			continue
 		}
 
-		// Check if this DM involves the target person
 		if e.Author == withPub || e.To == withPub {
 			results = append(results, e)
 		}
@@ -390,7 +392,7 @@ func (n *Node) ShareFile(filePath string, toPub string) error {
 		return fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
 	}
 
-	// Read file
+	// Read file to calculate hash
 	fileData, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
@@ -398,9 +400,9 @@ func (n *Node) ShareFile(filePath string, toPub string) error {
 
 	// Calculate file hash
 	fileHash := sha256.Sum256(fileData)
-	fileID := hex.EncodeToString(fileHash[:16]) // Use first 16 bytes as ID
+	fileID := hex.EncodeToString(fileHash[:16])
 
-	// Determine MIME type (basic)
+	// Determine MIME type
 	mimeType := "application/octet-stream"
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
@@ -414,46 +416,14 @@ func (n *Node) ShareFile(filePath string, toPub string) error {
 		mimeType = "image/gif"
 	case ".pdf":
 		mimeType = "application/pdf"
+	case ".webp":
+		mimeType = "image/webp"
 	}
 
 	// Calculate chunks
 	chunkCount := (len(fileData) + ChunkSize - 1) / ChunkSize
-	chunkIDs := make([]string, chunkCount)
 
-	// Create and send chunks first
-	for i := 0; i < chunkCount; i++ {
-		start := i * ChunkSize
-		end := start + ChunkSize
-		if end > len(fileData) {
-			end = len(fileData)
-		}
-
-		chunk := fileData[start:end]
-		chunkHash := sha256.Sum256(chunk)
-
-		// Create chunk event
-		chunkRef := &ChunkRef{
-			FileID: fileID,
-			Index:  i,
-			Hash:   hex.EncodeToString(chunkHash[:]),
-			Data:   base64.StdEncoding.EncodeToString(chunk),
-		}
-
-		var ev *Event
-		if toPub == "" {
-			// Global file share
-			ev = n.createGlobalChunkEvent(chunkRef)
-		} else {
-			// DM file share
-			ev = n.createDMChunkEvent(chunkRef, toPub)
-		}
-
-		signEvent(n.priv, ev)
-		n.ingestEvent(*ev, true)
-		chunkIDs[i] = ev.ID
-	}
-
-	// Create file metadata event
+	// Create file metadata
 	fileMeta := &FileMeta{
 		FileID:     fileID,
 		Name:       filepath.Base(filePath),
@@ -461,99 +431,146 @@ func (n *Node) ShareFile(filePath string, toPub string) error {
 		Hash:       hex.EncodeToString(fileHash[:]),
 		MimeType:   mimeType,
 		ChunkCount: chunkCount,
-		ChunkIDs:   chunkIDs,
 	}
 
-	var metaEvent *Event
+	// Store the file offer locally
+	n.fileOffersMu.Lock()
+	n.fileOffers[fileID] = &FileOffer{
+		Meta:      fileMeta,
+		LocalPath: filePath,
+		From:      n.cfg.PubKeyB64,
+		Nick:      n.cfg.Nick,
+		OfferTime: time.Now(),
+		IsLocal:   true,
+	}
+	n.fileOffersMu.Unlock()
+
+	// Create and send file announcement
+	var ev *Event
 	if toPub == "" {
-		metaEvent = n.createGlobalFileEvent(fileMeta)
+		ev = &Event{
+			Typ:      "file_announce",
+			Author:   n.cfg.PubKeyB64,
+			Nick:     n.cfg.Nick,
+			FileMeta: fileMeta,
+			TS:       time.Now().Unix(),
+		}
 	} else {
-		metaEvent = n.createDMFileEvent(fileMeta, toPub)
+		ev = &Event{
+			Typ:      "file_announce",
+			Author:   n.cfg.PubKeyB64,
+			Nick:     n.cfg.Nick,
+			To:       toPub,
+			FileMeta: fileMeta,
+			TS:       time.Now().Unix(),
+		}
 	}
 
-	signEvent(n.priv, metaEvent)
-	n.ingestEvent(*metaEvent, true)
+	signEvent(n.priv, ev)
+	n.ingestEvent(*ev, true)
 
 	return nil
 }
 
-func (n *Node) GetPendingFiles() []*FileTransfer {
-	n.fileTransfersMu.Lock()
-	defer n.fileTransfersMu.Unlock()
+func (n *Node) GetAvailableFiles() []*FileOffer {
+	n.fileOffersMu.Lock()
+	defer n.fileOffersMu.Unlock()
 
-	var pending []*FileTransfer
-	for _, ft := range n.fileTransfers {
-		if !ft.Complete {
-			pending = append(pending, ft)
-		}
+	var offers []*FileOffer
+	for _, offer := range n.fileOffers {
+		offers = append(offers, offer)
 	}
 
-	sort.Slice(pending, func(i, j int) bool {
-		return pending[i].StartTime.After(pending[j].StartTime)
+	sort.Slice(offers, func(i, j int) bool {
+		return offers[i].OfferTime.After(offers[j].OfferTime)
 	})
 
-	return pending
+	return offers
 }
 
-func (n *Node) GetFileProgress(fileID string) (received, total int, percent float64) {
-	n.fileTransfersMu.Lock()
-	defer n.fileTransfersMu.Unlock()
+func (n *Node) GetDownloads() []*FileDownload {
+	n.fileDownloadsMu.Lock()
+	defer n.fileDownloadsMu.Unlock()
 
-	ft, ok := n.fileTransfers[fileID]
-	if !ok {
-		return 0, 0, 0
+	var downloads []*FileDownload
+	for _, dl := range n.fileDownloads {
+		downloads = append(downloads, dl)
 	}
 
-	received = len(ft.ReceivedChunks)
-	total = ft.Meta.ChunkCount
-	if total > 0 {
-		percent = float64(received) / float64(total) * 100
-	}
-
-	return received, total, percent
+	return downloads
 }
 
-func (n *Node) SaveFile(fileID string, destPath string) error {
-	n.fileTransfersMu.Lock()
-	ft, ok := n.fileTransfers[fileID]
+func (n *Node) RequestFile(fileID string) error {
+	// Check if file is available
+	n.fileOffersMu.Lock()
+	offer, ok := n.fileOffers[fileID]
 	if !ok {
-		n.fileTransfersMu.Unlock()
-		return fmt.Errorf("file transfer not found")
+		n.fileOffersMu.Unlock()
+		return fmt.Errorf("file not available: %s", fileID)
+	}
+	offerCopy := *offer
+	n.fileOffersMu.Unlock()
+
+	// Don't download our own files
+	if offerCopy.IsLocal {
+		return fmt.Errorf("cannot download your own file")
 	}
 
-	if !ft.Complete {
-		n.fileTransfersMu.Unlock()
-		return fmt.Errorf("file transfer not complete")
-	}
-	n.fileTransfersMu.Unlock()
-
-	// For files we sent ourselves, we need to read the original file
-	// or reconstruct from chunks we sent
-	if ft.From == n.cfg.PubKeyB64 {
-		// We sent this file, so we can't download it
-		return fmt.Errorf("cannot save your own file (you already have it)")
+	// Check if already downloading
+	n.fileDownloadsMu.Lock()
+	if _, downloading := n.fileDownloads[fileID]; downloading {
+		n.fileDownloadsMu.Unlock()
+		return fmt.Errorf("already downloading this file")
 	}
 
-	// Reassemble file from received chunks
+	// Start download tracking
+	n.fileDownloads[fileID] = &FileDownload{
+		Meta:           offerCopy.Meta,
+		ReceivedChunks: make(map[int][]byte),
+		RequestTime:    time.Now(),
+		From:           offerCopy.From,
+		Complete:       false,
+	}
+	n.fileDownloadsMu.Unlock()
+
+	// Send file request event
+	req := &Event{
+		Typ:    "file_request",
+		Author: n.cfg.PubKeyB64,
+		Nick:   n.cfg.Nick,
+		FileReq: &FileReq{
+			FileID:    fileID,
+			Requester: n.cfg.PubKeyB64,
+		},
+		TS: time.Now().Unix(),
+	}
+
+	signEvent(n.priv, req)
+	n.ingestEvent(*req, true)
+
+	return nil
+}
+
+func (n *Node) SaveDownloadedFile(fileID string, destPath string) error {
+	n.fileDownloadsMu.Lock()
+	dl, ok := n.fileDownloads[fileID]
+	if !ok {
+		n.fileDownloadsMu.Unlock()
+		return fmt.Errorf("download not found")
+	}
+
+	if !dl.Complete {
+		n.fileDownloadsMu.Unlock()
+		return fmt.Errorf("download not complete")
+	}
+	n.fileDownloadsMu.Unlock()
+
+	// Reassemble file
 	var buf bytes.Buffer
-	for i := 0; i < ft.Meta.ChunkCount; i++ {
-		chunk, ok := ft.ReceivedChunks[i]
+	for i := 0; i < dl.Meta.ChunkCount; i++ {
+		chunk, ok := dl.ReceivedChunks[i]
 		if !ok {
-			// Try to load from event
-			n.stateMu.Lock()
-			if eventID, ok := ft.ChunkEvents[i]; ok {
-				if e, ok := n.state.Events[eventID]; ok && e.ChunkRef != nil {
-					if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
-						chunk = data
-						ft.ReceivedChunks[i] = chunk
-					}
-				}
-			}
-			n.stateMu.Unlock()
-
-			if chunk == nil {
-				return fmt.Errorf("missing chunk %d", i)
-			}
+			return fmt.Errorf("missing chunk %d", i)
 		}
 		buf.Write(chunk)
 	}
@@ -561,21 +578,20 @@ func (n *Node) SaveFile(fileID string, destPath string) error {
 	// Verify hash
 	fileData := buf.Bytes()
 	hash := sha256.Sum256(fileData)
-	if hex.EncodeToString(hash[:]) != ft.Meta.Hash {
+	if hex.EncodeToString(hash[:]) != dl.Meta.Hash {
 		return fmt.Errorf("file hash mismatch")
 	}
 
 	// Save to disk
 	if destPath == "" {
-		destPath = filepath.Join(n.downloadDir, ft.Meta.Name)
+		destPath = filepath.Join(n.downloadDir, dl.Meta.Name)
 	}
 
 	if err := os.WriteFile(destPath, fileData, 0644); err != nil {
 		return fmt.Errorf("save file: %w", err)
 	}
 
-	ft.SavePath = destPath
-	n.persistState()
+	dl.SavePath = destPath
 
 	return nil
 }
@@ -822,65 +838,57 @@ func (n *Node) ResolveWho(who string) string {
 	return ``
 }
 
-// ---------- File helpers ----------
-
-func (n *Node) createGlobalFileEvent(meta *FileMeta) *Event {
-	// Encrypt metadata for global recipients
-	metaJSON, _ := json.Marshal(meta)
-	recip := n.recipientsForGlobal()
-	enc, _ := n.encryptForRecipients(metaJSON, recip)
-
-	return &Event{
-		Typ:      "file",
-		Author:   n.cfg.PubKeyB64,
-		Nick:     n.cfg.Nick,
-		FileMeta: meta,
-		Enc:      enc,
-		TS:       time.Now().Unix(),
+// Helper to send chunks when someone requests a file
+func (n *Node) sendFileChunks(fileID string, requester string) {
+	n.fileOffersMu.Lock()
+	offer, ok := n.fileOffers[fileID]
+	if !ok || !offer.IsLocal {
+		n.fileOffersMu.Unlock()
+		return
 	}
-}
+	localPath := offer.LocalPath
+	meta := offer.Meta
+	n.fileOffersMu.Unlock()
 
-func (n *Node) createDMFileEvent(meta *FileMeta, toPub string) *Event {
-	metaJSON, _ := json.Marshal(meta)
-	recip := map[string]string{
-		n.cfg.PubKeyB64: n.encPubB64(),
+	// Read file
+	fileData, err := os.ReadFile(localPath)
+	if err != nil {
+		return
 	}
-	if encPub, ok := n.getEncPubFor(toPub); ok {
-		recip[toPub] = encPub
-	}
-	enc, _ := n.encryptForRecipients(metaJSON, recip)
 
-	return &Event{
-		Typ:      "file",
-		Author:   n.cfg.PubKeyB64,
-		Nick:     n.cfg.Nick,
-		To:       toPub,
-		FileMeta: meta,
-		Enc:      enc,
-		TS:       time.Now().Unix(),
-	}
-}
+	// Send chunks
+	for i := 0; i < meta.ChunkCount; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(fileData) {
+			end = len(fileData)
+		}
 
-func (n *Node) createGlobalChunkEvent(chunk *ChunkRef) *Event {
-	// Don't encrypt chunk data itself (already in the event)
-	// But we could encrypt it if needed
-	return &Event{
-		Typ:      "chunk",
-		Author:   n.cfg.PubKeyB64,
-		Nick:     n.cfg.Nick,
-		ChunkRef: chunk,
-		TS:       time.Now().Unix(),
-	}
-}
+		chunk := fileData[start:end]
+		chunkHash := sha256.Sum256(chunk)
 
-func (n *Node) createDMChunkEvent(chunk *ChunkRef, toPub string) *Event {
-	return &Event{
-		Typ:      "chunk",
-		Author:   n.cfg.PubKeyB64,
-		Nick:     n.cfg.Nick,
-		To:       toPub,
-		ChunkRef: chunk,
-		TS:       time.Now().Unix(),
+		// Create chunk event for the requester
+		chunkRef := &ChunkRef{
+			FileID:    fileID,
+			Index:     i,
+			Hash:      hex.EncodeToString(chunkHash[:]),
+			Data:      base64.StdEncoding.EncodeToString(chunk),
+			Requester: requester,
+		}
+
+		ev := &Event{
+			Typ:      "chunk",
+			Author:   n.cfg.PubKeyB64,
+			Nick:     n.cfg.Nick,
+			ChunkRef: chunkRef,
+			TS:       time.Now().Unix(),
+		}
+
+		signEvent(n.priv, ev)
+		n.ingestEvent(*ev, true)
+
+		// Small delay between chunks to avoid flooding
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -919,13 +927,7 @@ func ParseLink(s string) (addr, pubB64, nick string, err error) {
 // ---------- Private methods ----------
 
 func (n *Node) persistState() error {
-	n.stateMu.Lock()
-	n.fileTransfersMu.Lock()
-	n.state.Files = n.fileTransfers
-	err := saveJSONAtomic(n.statePath, n.state)
-	n.fileTransfersMu.Unlock()
-	n.stateMu.Unlock()
-	return err
+	return saveJSONAtomic(n.statePath, n.state)
 }
 
 func saveJSONAtomic(path string, v any) error {
@@ -1036,19 +1038,11 @@ func loadOrInitState(path string) (*State, error) {
 		if s.Events == nil {
 			s.Events = map[string]Event{}
 		}
-		if s.Files == nil {
-			s.Files = map[string]*FileTransfer{}
-		}
-		if s.ChunkIndex == nil {
-			s.ChunkIndex = map[string]map[int]string{}
-		}
 		return &s, nil
 	}
 	s := &State{
-		Events:     map[string]Event{},
-		Order:      []string{},
-		Files:      map[string]*FileTransfer{},
-		ChunkIndex: map[string]map[int]string{},
+		Events: map[string]Event{},
+		Order:  []string{},
 	}
 	if err := saveJSONAtomic(path, s); err != nil {
 		return nil, err
@@ -1087,6 +1081,185 @@ func getIPv6OnInterface(ifname string) (net.IP, error) {
 	}
 	return nil, errors.New(`no global IPv6 found on interface`)
 }
+
+// [Continue with all the private methods...]
+// [Keeping same structure but adding support for new event types]
+
+func (n *Node) ingestEvent(e Event, local bool) {
+	if err := verifyEvent(&e); err != nil {
+		return
+	}
+	n.touchContact(e.Author, e.Nick, ``, ``)
+	n.stateMu.Lock()
+	if _, ok := n.state.Events[e.ID]; ok {
+		n.stateMu.Unlock()
+		return
+	}
+	n.state.Events[e.ID] = e
+	n.state.Order = append(n.state.Order, e.ID)
+	n.stateMu.Unlock()
+
+	// Handle different event types
+	switch e.Typ {
+	case "file_announce":
+		if e.FileMeta != nil {
+			n.handleFileAnnounce(&e)
+		}
+	case "file_request":
+		if e.FileReq != nil {
+			n.handleFileRequest(&e)
+		}
+	case "chunk":
+		if e.ChunkRef != nil {
+			n.handleChunk(&e)
+		}
+	}
+
+	n.persistState()
+
+	if n.eventHandler == nil {
+		return
+	}
+
+	plain, ok := n.decryptEvent(&e)
+	switch e.Typ {
+	case `msg`:
+		n.eventHandler(EventMessage, MessageEvent{
+			Event:     &e,
+			Timestamp: time.Unix(e.TS, 0),
+			Author:    e.Author,
+			Nick:      e.Nick,
+			Body:      plain,
+			Encrypted: !ok,
+		})
+	case `dm`:
+		if e.Author == n.cfg.PubKeyB64 {
+			n.eventHandler(EventDM, DMEvent{
+				Event:     &e,
+				Timestamp: time.Unix(e.TS, 0),
+				Author:    e.Author,
+				Nick:      e.Nick,
+				To:        e.To,
+				Body:      plain,
+				Encrypted: !ok,
+				Incoming:  false,
+			})
+		} else if e.To == n.cfg.PubKeyB64 {
+			if ok {
+				n.lastDMFromMu.Lock()
+				n.lastDMFrom = e.Author
+				n.lastDMFromMu.Unlock()
+			}
+			n.eventHandler(EventDM, DMEvent{
+				Event:     &e,
+				Timestamp: time.Unix(e.TS, 0),
+				Author:    e.Author,
+				Nick:      e.Nick,
+				To:        e.To,
+				Body:      plain,
+				Encrypted: !ok,
+				Incoming:  true,
+			})
+		}
+	}
+}
+
+func (n *Node) handleFileAnnounce(e *Event) {
+	if e.FileMeta == nil || e.Author == n.cfg.PubKeyB64 {
+		return // Don't process our own announcements
+	}
+
+	// Check if this is for us (DM) or global
+	if e.To != "" && e.To != n.cfg.PubKeyB64 {
+		return // Not for us
+	}
+
+	n.fileOffersMu.Lock()
+	n.fileOffers[e.FileMeta.FileID] = &FileOffer{
+		Meta:      e.FileMeta,
+		From:      e.Author,
+		Nick:      e.Nick,
+		OfferTime: time.Unix(e.TS, 0),
+		IsLocal:   false,
+	}
+	n.fileOffersMu.Unlock()
+
+	if n.eventHandler != nil {
+		n.eventHandler(EventFileOffer, FileOfferEvent{
+			FileID:   e.FileMeta.FileID,
+			FileName: e.FileMeta.Name,
+			FileSize: e.FileMeta.Size,
+			From:     e.Author,
+			Nick:     e.Nick,
+		})
+	}
+}
+
+func (n *Node) handleFileRequest(e *Event) {
+	if e.FileReq == nil {
+		return
+	}
+
+	// Check if we have this file
+	n.fileOffersMu.Lock()
+	offer, ok := n.fileOffers[e.FileReq.FileID]
+	if !ok || !offer.IsLocal {
+		n.fileOffersMu.Unlock()
+		return
+	}
+	n.fileOffersMu.Unlock()
+
+	// Send chunks to requester
+	go n.sendFileChunks(e.FileReq.FileID, e.FileReq.Requester)
+}
+
+func (n *Node) handleChunk(e *Event) {
+	if e.ChunkRef == nil {
+		return
+	}
+
+	// Check if this chunk is for us
+	if e.ChunkRef.Requester != "" && e.ChunkRef.Requester != n.cfg.PubKeyB64 {
+		return // Not for us
+	}
+
+	n.fileDownloadsMu.Lock()
+	dl, ok := n.fileDownloads[e.ChunkRef.FileID]
+	if !ok {
+		n.fileDownloadsMu.Unlock()
+		return
+	}
+
+	// Decode and store chunk
+	if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
+		dl.ReceivedChunks[e.ChunkRef.Index] = data
+
+		// Check if complete
+		if len(dl.ReceivedChunks) == dl.Meta.ChunkCount {
+			dl.Complete = true
+
+			if n.eventHandler != nil {
+				n.eventHandler(EventFileComplete, FileCompleteEvent{
+					FileID:   e.ChunkRef.FileID,
+					FileName: dl.Meta.Name,
+				})
+			}
+		} else if n.eventHandler != nil {
+			// Progress update
+			percent := float64(len(dl.ReceivedChunks)) / float64(dl.Meta.ChunkCount) * 100
+			n.eventHandler(EventFileProgress, FileProgressEvent{
+				FileID:         e.ChunkRef.FileID,
+				FileName:       dl.Meta.Name,
+				ReceivedChunks: len(dl.ReceivedChunks),
+				TotalChunks:    dl.Meta.ChunkCount,
+				Percent:        percent,
+			})
+		}
+	}
+	n.fileDownloadsMu.Unlock()
+}
+
+// ... continuing from handleChunk function ...
 
 func (n *Node) isAccepted(pub string) bool {
 	n.cfgMu.Lock()
@@ -1204,7 +1377,7 @@ func (n *Node) handleConn(conn net.Conn) {
 	defer conn.Close()
 	enc := json.NewEncoder(conn)
 	dec := bufio.NewScanner(conn)
-	dec.Buffer(make([]byte, 0, 65536), 10<<20)
+	dec.Buffer(make([]byte, 0, 65536), 10<<20) // Increased for file chunks
 
 	if err := enc.Encode(WireMsg{Kind: `HELLO`, Node: n.cfg.PubKeyB64, Nick: n.cfg.Nick, Listen: n.cfg.ListenOn, EKey: base64.StdEncoding.EncodeToString(n.encPub[:])}); err != nil {
 		return
@@ -1490,208 +1663,6 @@ func (n *Node) missingOf(peerIDs []string) []string {
 	return missing
 }
 
-func (n *Node) ingestEvent(e Event, local bool) {
-	if err := verifyEvent(&e); err != nil {
-		return
-	}
-	n.touchContact(e.Author, e.Nick, ``, ``)
-	n.stateMu.Lock()
-	if _, ok := n.state.Events[e.ID]; ok {
-		n.stateMu.Unlock()
-		return
-	}
-	n.state.Events[e.ID] = e
-	n.state.Order = append(n.state.Order, e.ID)
-	n.stateMu.Unlock()
-
-	// Handle file-related events
-	if e.Typ == "file" && e.FileMeta != nil {
-		n.handleFileMetaEvent(&e)
-	} else if e.Typ == "chunk" && e.ChunkRef != nil {
-		n.handleChunkEvent(&e)
-	}
-
-	n.persistState()
-
-	if n.eventHandler == nil {
-		return
-	}
-
-	plain, ok := n.decryptEvent(&e)
-	switch e.Typ {
-	case `msg`:
-		n.eventHandler(EventMessage, MessageEvent{
-			Event:     &e,
-			Timestamp: time.Unix(e.TS, 0),
-			Author:    e.Author,
-			Nick:      e.Nick,
-			Body:      plain,
-			Encrypted: !ok,
-		})
-	case `dm`:
-		if e.Author == n.cfg.PubKeyB64 {
-			n.eventHandler(EventDM, DMEvent{
-				Event:     &e,
-				Timestamp: time.Unix(e.TS, 0),
-				Author:    e.Author,
-				Nick:      e.Nick,
-				To:        e.To,
-				Body:      plain,
-				Encrypted: !ok,
-				Incoming:  false,
-			})
-		} else if e.To == n.cfg.PubKeyB64 {
-			if ok {
-				n.lastDMFromMu.Lock()
-				n.lastDMFrom = e.Author
-				n.lastDMFromMu.Unlock()
-			}
-			n.eventHandler(EventDM, DMEvent{
-				Event:     &e,
-				Timestamp: time.Unix(e.TS, 0),
-				Author:    e.Author,
-				Nick:      e.Nick,
-				To:        e.To,
-				Body:      plain,
-				Encrypted: !ok,
-				Incoming:  true,
-			})
-		}
-	}
-}
-
-// ... (keeping all the previous code the same until the handleFileMetaEvent function)
-
-func (n *Node) handleFileMetaEvent(e *Event) {
-	if e.FileMeta == nil {
-		return
-	}
-
-	// Check if this is relevant to us:
-	// 1. Global file (no To field)
-	// 2. DM to us (To == our pub key)
-	// 3. DM from us (Author == our pub key, we need to track our own sends)
-	if e.To != "" && e.To != n.cfg.PubKeyB64 && e.Author != n.cfg.PubKeyB64 {
-		return // Not for us
-	}
-
-	n.fileTransfersMu.Lock()
-	defer n.fileTransfersMu.Unlock()
-
-	if _, exists := n.fileTransfers[e.FileMeta.FileID]; exists {
-		return // Already tracking this file
-	}
-
-	ft := &FileTransfer{
-		Meta:           e.FileMeta,
-		ReceivedChunks: make(map[int][]byte),
-		ChunkEvents:    make(map[int]string),
-		Complete:       false,
-		StartTime:      time.Now(),
-		From:           e.Author,
-	}
-
-	// If we're the author, mark it as complete (we have all chunks)
-	if e.Author == n.cfg.PubKeyB64 {
-		ft.Complete = true
-		now := time.Now()
-		ft.EndTime = &now
-		// Load our own chunks
-		for i := 0; i < e.FileMeta.ChunkCount; i++ {
-			if i < len(e.FileMeta.ChunkIDs) {
-				ft.ChunkEvents[i] = e.FileMeta.ChunkIDs[i]
-			}
-		}
-	} else {
-		// Check if we already have chunks for this file
-		n.stateMu.Lock()
-		if chunkMap, ok := n.state.ChunkIndex[e.FileMeta.FileID]; ok {
-			for idx, eventID := range chunkMap {
-				ft.ChunkEvents[idx] = eventID
-			}
-			if len(ft.ChunkEvents) == e.FileMeta.ChunkCount {
-				ft.Complete = true
-				now := time.Now()
-				ft.EndTime = &now
-			}
-		}
-		n.stateMu.Unlock()
-	}
-
-	n.fileTransfers[e.FileMeta.FileID] = ft
-
-	// Only send file event notification if it's from someone else
-	if n.eventHandler != nil && e.Author != n.cfg.PubKeyB64 {
-		n.eventHandler(EventFile, FileEvent{
-			FileID:   e.FileMeta.FileID,
-			FileName: e.FileMeta.Name,
-			FileSize: e.FileMeta.Size,
-			From:     e.Author,
-			Nick:     e.Nick,
-		})
-
-		if ft.Complete {
-			n.eventHandler(EventFileComplete, FileCompleteEvent{
-				FileID:   e.FileMeta.FileID,
-				FileName: e.FileMeta.Name,
-			})
-		}
-	}
-}
-
-func (n *Node) handleChunkEvent(e *Event) {
-	if e.ChunkRef == nil {
-		return
-	}
-
-	// Update chunk index
-	n.stateMu.Lock()
-	if n.state.ChunkIndex == nil {
-		n.state.ChunkIndex = make(map[string]map[int]string)
-	}
-	if n.state.ChunkIndex[e.ChunkRef.FileID] == nil {
-		n.state.ChunkIndex[e.ChunkRef.FileID] = make(map[int]string)
-	}
-	n.state.ChunkIndex[e.ChunkRef.FileID][e.ChunkRef.Index] = e.ID
-	n.stateMu.Unlock()
-
-	// Update file transfer (only if we're tracking it and didn't send it ourselves)
-	n.fileTransfersMu.Lock()
-	ft, ok := n.fileTransfers[e.ChunkRef.FileID]
-	if ok && ft.From != n.cfg.PubKeyB64 { // Don't process chunks for files we sent
-		// Decode and store chunk
-		if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
-			ft.ReceivedChunks[e.ChunkRef.Index] = data
-			ft.ChunkEvents[e.ChunkRef.Index] = e.ID
-
-			// Check if complete
-			if len(ft.ChunkEvents) == ft.Meta.ChunkCount && !ft.Complete {
-				ft.Complete = true
-				now := time.Now()
-				ft.EndTime = &now
-
-				if n.eventHandler != nil {
-					n.eventHandler(EventFileComplete, FileCompleteEvent{
-						FileID:   e.ChunkRef.FileID,
-						FileName: ft.Meta.Name,
-					})
-				}
-			} else if n.eventHandler != nil && !ft.Complete {
-				// Progress update
-				percent := float64(len(ft.ReceivedChunks)) / float64(ft.Meta.ChunkCount) * 100
-				n.eventHandler(EventFileProgress, FileProgressEvent{
-					FileID:         e.ChunkRef.FileID,
-					FileName:       ft.Meta.Name,
-					ReceivedChunks: len(ft.ReceivedChunks),
-					TotalChunks:    ft.Meta.ChunkCount,
-					Percent:        percent,
-				})
-			}
-		}
-	}
-	n.fileTransfersMu.Unlock()
-}
-
 // ---------- Event verification ----------
 
 type encDigest struct {
@@ -1735,13 +1706,14 @@ func eventDigest(e *Event) []byte {
 		TS       int64      `json:"ts"`
 		Enc      *encDigest `json:"enc,omitempty"`
 		FileMeta *FileMeta  `json:"file_meta,omitempty"`
+		FileReq  *FileReq   `json:"file_req,omitempty"`
 		ChunkRef *ChunkRef  `json:"chunk_ref,omitempty"`
 	}
 	var encD *encDigest
 	if e.Enc != nil {
 		encD = canonicalizeEnc(e.Enc)
 	}
-	j, _ := json.Marshal(bare{e.Typ, e.Author, e.Nick, e.Body, e.To, e.TS, encD, e.FileMeta, e.ChunkRef})
+	j, _ := json.Marshal(bare{e.Typ, e.Author, e.Nick, e.Body, e.To, e.TS, encD, e.FileMeta, e.FileReq, e.ChunkRef})
 	sum := sha256.Sum256(j)
 	return sum[:]
 }

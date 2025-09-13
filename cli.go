@@ -1,4 +1,3 @@
-// cli.go - Command-line interface for gossip with file sharing
 package main
 
 import (
@@ -13,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -82,10 +82,10 @@ func main() {
 						dm.Body)
 				}
 			}
-		case EventFile:
-			fe := data.(FileEvent)
+		case EventFileOffer:
+			fe := data.(FileOfferEvent)
 			size := formatFileSize(fe.FileSize)
-			fmt.Printf("[%s] 📎 %s shared file: %s (%s) - ID: %s\n",
+			fmt.Printf("[%s] 📎 %s is sharing: %s (%s) - /download %s\n",
 				time.Now().Format("15:04:05"),
 				displayFromPub(fe.Nick, fe.From),
 				fe.FileName,
@@ -93,14 +93,14 @@ func main() {
 				fe.FileID[:8])
 		case EventFileProgress:
 			fp := data.(FileProgressEvent)
-			fmt.Printf("\r[file] %s: %.1f%% (%d/%d chunks)",
+			fmt.Printf("\r[download] %s: %.1f%% (%d/%d chunks)",
 				fp.FileName,
 				fp.Percent,
 				fp.ReceivedChunks,
 				fp.TotalChunks)
 		case EventFileComplete:
 			fc := data.(FileCompleteEvent)
-			fmt.Printf("\n[file] ✅ %s complete! Use /files to see, /save %s to download\n",
+			fmt.Printf("\n[download] ✅ %s complete! Use /save %s to save to disk\n",
 				fc.FileName,
 				fc.FileID[:8])
 		case EventPeerRequest:
@@ -149,7 +149,7 @@ func main() {
 	fmt.Printf("Address: [%s]:%d (iface=%s)\n", node.GetYggIP().String(), node.GetPort(), node.GetInterface())
 	fmt.Printf("Peers: %v\n", node.ListPeers())
 	fmt.Println("Tip: /link to print a QR; /accept <gossip://…> to connect; /pending then /accept <SHORTID> to approve.")
-	fmt.Println("New: /file <path> [to] to share files; /files to see downloads; /save <id> to save")
+	fmt.Println("New: /file <path> to share; /files to list; /download <id> to get; /save <id> to save")
 
 	// Start REPL
 	go repl(node)
@@ -206,10 +206,11 @@ func handleCommand(node *Node, line string) {
   /search <query>         search messages
   /history [n]            show last n messages (default 20)
   /dmhistory <who> [n]    show DM history with someone
-  /file <path> [to]       share a file (globally or to someone)
-  /files                  list pending file transfers
-  /save <fileid> [path]   save a received file
-  /save                   save state
+  /file <path> [to]       share a file (globally or DM to someone)
+  /files                  list available files
+  /downloads              list active downloads
+  /download <id>          start downloading a file
+  /save <id> [path]       save a downloaded file
   /quit                   exit`)
 
 	case "link":
@@ -354,7 +355,6 @@ func handleCommand(node *Node, line string) {
 		if len(events) == 0 {
 			fmt.Println("No messages in history")
 		} else {
-			// Display in chronological order (reverse)
 			for i := len(events) - 1; i >= 0; i-- {
 				displayEvent(node, &events[i])
 			}
@@ -380,7 +380,6 @@ func handleCommand(node *Node, line string) {
 			fmt.Println("No DM history")
 		} else {
 			fmt.Printf("DM history with %s:\n", who)
-			// Display in chronological order (reverse)
 			for i := len(events) - 1; i >= 0; i-- {
 				displayEvent(node, &events[i])
 			}
@@ -406,7 +405,7 @@ func handleCommand(node *Node, line string) {
 		if toPub != "" {
 			fmt.Printf(" to %s", targetLabel(node, toPub))
 		} else {
-			fmt.Printf(" globally")
+			fmt.Printf(" (globally)")
 		}
 		fmt.Println("...")
 
@@ -414,34 +413,80 @@ func handleCommand(node *Node, line string) {
 		if err != nil {
 			fmt.Println("[err]", err)
 		} else {
-			fmt.Println("[ok] file shared!")
+			fmt.Println("[ok] file announced! Others can /download it")
 		}
 
 	case "files":
-		files := node.GetPendingFiles()
+		files := node.GetAvailableFiles()
 		if len(files) == 0 {
-			fmt.Println("No file transfers")
+			fmt.Println("No files available")
 		} else {
-			fmt.Println("File transfers:")
-			for _, ft := range files {
-				status := "pending"
-				if ft.Complete {
-					status = "complete"
-					if ft.SavePath != "" {
-						status = fmt.Sprintf("saved to %s", ft.SavePath)
-					}
-				} else {
-					r, t, p := node.GetFileProgress(ft.Meta.FileID)
-					status = fmt.Sprintf("%.1f%% (%d/%d chunks)", p, r, t)
+			fmt.Println("Available files:")
+			for _, f := range files {
+				status := "available"
+				if f.IsLocal {
+					status = "sharing"
 				}
-				from := displayFromPub("", ft.From)
-				fmt.Printf(" - %s: %s (%s) from %s - %s\n",
-					ft.Meta.FileID[:8],
-					ft.Meta.Name,
-					formatFileSize(ft.Meta.Size),
+				from := displayFromPub(f.Nick, f.From)
+				fmt.Printf(" - %s: %s (%s) from %s [%s]\n",
+					f.Meta.FileID[:8],
+					f.Meta.Name,
+					formatFileSize(f.Meta.Size),
 					from,
 					status)
 			}
+		}
+
+	case "downloads":
+		downloads := node.GetDownloads()
+		if len(downloads) == 0 {
+			fmt.Println("No active downloads")
+		} else {
+			fmt.Println("Downloads:")
+			for _, dl := range downloads {
+				status := fmt.Sprintf("%.1f%% (%d/%d chunks)",
+					float64(len(dl.ReceivedChunks))/float64(dl.Meta.ChunkCount)*100,
+					len(dl.ReceivedChunks),
+					dl.Meta.ChunkCount)
+				if dl.Complete {
+					status = "complete - ready to save"
+				}
+				fmt.Printf(" - %s: %s (%s) - %s\n",
+					dl.Meta.FileID[:8],
+					dl.Meta.Name,
+					formatFileSize(dl.Meta.Size),
+					status)
+			}
+		}
+
+	case "download":
+		if len(parts) < 2 {
+			fmt.Println("usage: /download <file_id>")
+			return
+		}
+		fileID := parts[1]
+
+		// Find matching file (allow prefix match)
+		files := node.GetAvailableFiles()
+		var matched *FileOffer
+		for _, f := range files {
+			if strings.HasPrefix(f.Meta.FileID, fileID) {
+				matched = f
+				break
+			}
+		}
+
+		if matched == nil {
+			fmt.Println("[err] file not found. Use /files to see available files")
+			return
+		}
+
+		fmt.Printf("Requesting download of %s...\n", matched.Meta.Name)
+		err := node.RequestFile(matched.Meta.FileID)
+		if err != nil {
+			fmt.Println("[err]", err)
+		} else {
+			fmt.Println("[ok] download started!")
 		}
 
 	case "save":
@@ -453,25 +498,24 @@ func handleCommand(node *Node, line string) {
 		}
 
 		fileID := parts[1]
-		// Find matching file ID (allow prefix match)
-		files := node.GetPendingFiles()
-		var matchedFile *FileTransfer
-		for _, ft := range files {
-			if strings.HasPrefix(ft.Meta.FileID, fileID) {
-				matchedFile = ft
+		// Find matching download
+		downloads := node.GetDownloads()
+		var matched *FileDownload
+		for _, dl := range downloads {
+			if strings.HasPrefix(dl.Meta.FileID, fileID) {
+				matched = dl
 				break
 			}
 		}
 
-		if matchedFile == nil {
-			fmt.Println("[err] file not found:", fileID)
+		if matched == nil {
+			fmt.Println("[err] download not found. Use /downloads to see active downloads")
 			return
 		}
 
-		// Check if this is our own file
-		if matchedFile.From == node.GetPublicKeyB64() {
-			fmt.Println("[info] This is your own file - you already have it!")
-			fmt.Printf("Original file was: %s\n", matchedFile.Meta.Name)
+		if !matched.Complete {
+			fmt.Printf("[err] download not complete (%.1f%%)\n",
+				float64(len(matched.ReceivedChunks))/float64(matched.Meta.ChunkCount)*100)
 			return
 		}
 
@@ -480,16 +524,17 @@ func handleCommand(node *Node, line string) {
 			destPath = expandPath(parts[2])
 		}
 
-		fmt.Printf("Saving %s...\n", matchedFile.Meta.Name)
-		err := node.SaveFile(matchedFile.Meta.FileID, destPath)
+		fmt.Printf("Saving %s...\n", matched.Meta.Name)
+		err := node.SaveDownloadedFile(matched.Meta.FileID, destPath)
 		if err != nil {
 			fmt.Println("[err]", err)
 		} else {
 			if destPath == "" {
-				destPath = filepath.Join("downloads", matchedFile.Meta.Name)
+				destPath = filepath.Join("downloads", matched.Meta.Name)
 			}
 			fmt.Printf("[ok] saved to %s\n", destPath)
 		}
+
 	case "quit", "exit":
 		node.Shutdown()
 
@@ -633,9 +678,8 @@ func formatFileSize(size int64) string {
 
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			path = filepath.Join(home, path[2:])
+		if home, err := user.Current(); err == nil {
+			path = filepath.Join(home.HomeDir, path[2:])
 		}
 	}
 	return path
