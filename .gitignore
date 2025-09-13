@@ -34,3 +34,5 @@ go.work.sum
 gossip_config.json
 gossip_state.json
 gossip
+
+downloads/
