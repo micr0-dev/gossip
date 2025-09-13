@@ -1,4 +1,4 @@
-// gossipy.go - Core gossip protocol implementation with file sharing
+// gossip.go - Core gossip protocol implementation with file sharing
 package main
 
 import (
@@ -527,7 +527,14 @@ func (n *Node) SaveFile(fileID string, destPath string) error {
 	}
 	n.fileTransfersMu.Unlock()
 
-	// Reassemble file
+	// For files we sent ourselves, we need to read the original file
+	// or reconstruct from chunks we sent
+	if ft.From == n.cfg.PubKeyB64 {
+		// We sent this file, so we can't download it
+		return fmt.Errorf("cannot save your own file (you already have it)")
+	}
+
+	// Reassemble file from received chunks
 	var buf bytes.Buffer
 	for i := 0; i < ft.Meta.ChunkCount; i++ {
 		chunk, ok := ft.ReceivedChunks[i]
@@ -611,7 +618,7 @@ func (n *Node) GetInterface() string {
 }
 
 func (n *Node) BuildLink() string {
-	u := &url.URL{Scheme: `gossipy`, Host: fmt.Sprintf(`[%s]:%d`, n.yggIP.String(), n.port)}
+	u := &url.URL{Scheme: `gossip`, Host: fmt.Sprintf(`[%s]:%d`, n.yggIP.String(), n.port)}
 	q := url.Values{}
 	q.Set(`id`, base64.RawURLEncoding.EncodeToString(n.pub))
 	q.Set(`nick`, n.cfg.Nick)
@@ -888,8 +895,8 @@ func ShortKey(b64 string) string {
 }
 
 func ParseLink(s string) (addr, pubB64, nick string, err error) {
-	if !strings.HasPrefix(s, `gossipy://`) {
-		return ``, ``, ``, errors.New(`not a gossipy:// link`)
+	if !strings.HasPrefix(s, `gossip://`) {
+		return ``, ``, ``, errors.New(`not a gossip:// link`)
 	}
 	u, err := url.Parse(s)
 	if err != nil {
@@ -1553,29 +1560,50 @@ func (n *Node) ingestEvent(e Event, local bool) {
 	}
 }
 
+// ... (keeping all the previous code the same until the handleFileMetaEvent function)
+
 func (n *Node) handleFileMetaEvent(e *Event) {
 	if e.FileMeta == nil {
 		return
 	}
 
-	// Check if this is for us (DM) or global
+	// Check if this is relevant to us:
+	// 1. Global file (no To field)
+	// 2. DM to us (To == our pub key)
+	// 3. DM from us (Author == our pub key, we need to track our own sends)
 	if e.To != "" && e.To != n.cfg.PubKeyB64 && e.Author != n.cfg.PubKeyB64 {
 		return // Not for us
 	}
 
 	n.fileTransfersMu.Lock()
-	if _, exists := n.fileTransfers[e.FileMeta.FileID]; !exists {
-		ft := &FileTransfer{
-			Meta:           e.FileMeta,
-			ReceivedChunks: make(map[int][]byte),
-			ChunkEvents:    make(map[int]string),
-			Complete:       false,
-			StartTime:      time.Now(),
-			From:           e.Author,
-		}
-		n.fileTransfers[e.FileMeta.FileID] = ft
+	defer n.fileTransfersMu.Unlock()
 
-		// Check if we already have all chunks
+	if _, exists := n.fileTransfers[e.FileMeta.FileID]; exists {
+		return // Already tracking this file
+	}
+
+	ft := &FileTransfer{
+		Meta:           e.FileMeta,
+		ReceivedChunks: make(map[int][]byte),
+		ChunkEvents:    make(map[int]string),
+		Complete:       false,
+		StartTime:      time.Now(),
+		From:           e.Author,
+	}
+
+	// If we're the author, mark it as complete (we have all chunks)
+	if e.Author == n.cfg.PubKeyB64 {
+		ft.Complete = true
+		now := time.Now()
+		ft.EndTime = &now
+		// Load our own chunks
+		for i := 0; i < e.FileMeta.ChunkCount; i++ {
+			if i < len(e.FileMeta.ChunkIDs) {
+				ft.ChunkEvents[i] = e.FileMeta.ChunkIDs[i]
+			}
+		}
+	} else {
+		// Check if we already have chunks for this file
 		n.stateMu.Lock()
 		if chunkMap, ok := n.state.ChunkIndex[e.FileMeta.FileID]; ok {
 			for idx, eventID := range chunkMap {
@@ -1589,9 +1617,11 @@ func (n *Node) handleFileMetaEvent(e *Event) {
 		}
 		n.stateMu.Unlock()
 	}
-	n.fileTransfersMu.Unlock()
 
-	if n.eventHandler != nil {
+	n.fileTransfers[e.FileMeta.FileID] = ft
+
+	// Only send file event notification if it's from someone else
+	if n.eventHandler != nil && e.Author != n.cfg.PubKeyB64 {
 		n.eventHandler(EventFile, FileEvent{
 			FileID:   e.FileMeta.FileID,
 			FileName: e.FileMeta.Name,
@@ -1599,6 +1629,13 @@ func (n *Node) handleFileMetaEvent(e *Event) {
 			From:     e.Author,
 			Nick:     e.Nick,
 		})
+
+		if ft.Complete {
+			n.eventHandler(EventFileComplete, FileCompleteEvent{
+				FileID:   e.FileMeta.FileID,
+				FileName: e.FileMeta.Name,
+			})
+		}
 	}
 }
 
@@ -1618,17 +1655,17 @@ func (n *Node) handleChunkEvent(e *Event) {
 	n.state.ChunkIndex[e.ChunkRef.FileID][e.ChunkRef.Index] = e.ID
 	n.stateMu.Unlock()
 
-	// Update file transfer
+	// Update file transfer (only if we're tracking it and didn't send it ourselves)
 	n.fileTransfersMu.Lock()
 	ft, ok := n.fileTransfers[e.ChunkRef.FileID]
-	if ok {
+	if ok && ft.From != n.cfg.PubKeyB64 { // Don't process chunks for files we sent
 		// Decode and store chunk
 		if data, err := base64.StdEncoding.DecodeString(e.ChunkRef.Data); err == nil {
 			ft.ReceivedChunks[e.ChunkRef.Index] = data
 			ft.ChunkEvents[e.ChunkRef.Index] = e.ID
 
 			// Check if complete
-			if len(ft.ChunkEvents) == ft.Meta.ChunkCount {
+			if len(ft.ChunkEvents) == ft.Meta.ChunkCount && !ft.Complete {
 				ft.Complete = true
 				now := time.Now()
 				ft.EndTime = &now
@@ -1639,7 +1676,7 @@ func (n *Node) handleChunkEvent(e *Event) {
 						FileName: ft.Meta.Name,
 					})
 				}
-			} else if n.eventHandler != nil {
+			} else if n.eventHandler != nil && !ft.Complete {
 				// Progress update
 				percent := float64(len(ft.ReceivedChunks)) / float64(ft.Meta.ChunkCount) * 100
 				n.eventHandler(EventFileProgress, FileProgressEvent{

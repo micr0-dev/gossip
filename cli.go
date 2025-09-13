@@ -1,4 +1,4 @@
-// cli.go - Command-line interface for gossipy with file sharing
+// cli.go - Command-line interface for gossip with file sharing
 package main
 
 import (
@@ -25,8 +25,8 @@ func main() {
 	var (
 		iface = flag.String("iface", "tun0", "Yggdrasil interface (e.g. tun0 or ygg0)")
 		port  = flag.Int("port", 19999, "TCP port to listen on (IPv6)")
-		state = flag.String("state", "./gossipy_state.json", "Path to state JSON")
-		conf  = flag.String("config", "./gossipy_config.json", "Path to config JSON")
+		state = flag.String("state", "./gossip_state.json", "Path to state JSON")
+		conf  = flag.String("config", "./gossip_config.json", "Path to config JSON")
 		nick  = flag.String("nick", "", "Nickname (optional)")
 		peer  = flag.String("peer", "", "Add a peer on startup ([IPv6]:port)")
 	)
@@ -145,10 +145,10 @@ func main() {
 	}()
 
 	// Print startup info
-	fmt.Printf("gossipy v%s | nick=%q | id=%s\n", Version, node.GetNick(), ShortKey(node.GetPublicKeyB64()))
+	fmt.Printf("gossip v%s | nick=%q | id=%s\n", Version, node.GetNick(), ShortKey(node.GetPublicKeyB64()))
 	fmt.Printf("Address: [%s]:%d (iface=%s)\n", node.GetYggIP().String(), node.GetPort(), node.GetInterface())
 	fmt.Printf("Peers: %v\n", node.ListPeers())
-	fmt.Println("Tip: /link to print a QR; /accept <gossipy://…> to connect; /pending then /accept <SHORTID> to approve.")
+	fmt.Println("Tip: /link to print a QR; /accept <gossip://…> to connect; /pending then /accept <SHORTID> to approve.")
 	fmt.Println("New: /file <path> [to] to share files; /files to see downloads; /save <id> to save")
 
 	// Start REPL
@@ -194,7 +194,7 @@ func handleCommand(node *Node, line string) {
 	switch cmd {
 	case "help":
 		fmt.Println(`Commands:
-  /link                   show your gossipy:// link + QR
+  /link                   show your gossip:// link + QR
   /accept <link|pub|id>   accept pending OR connect using a link
   /pending                list pending peer requests
   /contacts               list known contacts
@@ -252,11 +252,11 @@ func handleCommand(node *Node, line string) {
 
 	case "accept":
 		if len(parts) < 2 {
-			fmt.Println("usage: /accept <gossipy://... | pubkey | SHORTID>")
+			fmt.Println("usage: /accept <gossip://... | pubkey | SHORTID>")
 			return
 		}
 		arg := strings.TrimSpace(strings.TrimPrefix(line, "/accept"))
-		if strings.HasPrefix(arg, "gossipy://") {
+		if strings.HasPrefix(arg, "gossip://") {
 			err := node.AcceptPeerByLink(arg)
 			if err != nil {
 				fmt.Println("[err]", err)
@@ -468,6 +468,13 @@ func handleCommand(node *Node, line string) {
 			return
 		}
 
+		// Check if this is our own file
+		if matchedFile.From == node.GetPublicKeyB64() {
+			fmt.Println("[info] This is your own file - you already have it!")
+			fmt.Printf("Original file was: %s\n", matchedFile.Meta.Name)
+			return
+		}
+
 		var destPath string
 		if len(parts) > 2 {
 			destPath = expandPath(parts[2])
@@ -483,7 +490,6 @@ func handleCommand(node *Node, line string) {
 			}
 			fmt.Printf("[ok] saved to %s\n", destPath)
 		}
-
 	case "quit", "exit":
 		node.Shutdown()
 
