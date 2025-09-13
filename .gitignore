@@ -31,6 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 
-gossipy_config.json
-gossipy_state.json
-gossipy
+gossip_config.json
+gossip_state.json
+gossip

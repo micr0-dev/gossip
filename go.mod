@@ -1,4 +1,4 @@
-module gossipy
+module gossip
 
 go 1.24.3
 
